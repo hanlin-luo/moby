@@ -47,6 +47,7 @@ import (
 	"github.com/docker/docker/pkg/fileutils"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/plugingetter"
+	"github.com/docker/docker/pkg/sysinfo"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/pkg/truncindex"
 	"github.com/docker/docker/plugin"
@@ -56,6 +57,7 @@ import (
 	"github.com/docker/docker/runconfig"
 	volumesservice "github.com/docker/docker/volume/service"
 	"github.com/moby/buildkit/util/resolver"
+	resolverconfig "github.com/moby/buildkit/util/resolver/config"
 	"github.com/moby/locker"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -64,11 +66,7 @@ import (
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
-)
-
-// ContainersNamespace is the name of the namespace used for users containers
-const (
-	ContainersNamespace = "moby"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 var (
@@ -77,7 +75,7 @@ var (
 
 // Daemon holds information about the Docker daemon.
 type Daemon struct {
-	ID                    string
+	id                    string
 	repository            string
 	containers            container.Store
 	containersReplica     container.ViewDB
@@ -87,15 +85,15 @@ type Daemon struct {
 	configStore           *config.Config
 	statsCollector        *stats.Collector
 	defaultLogConfig      containertypes.LogConfig
-	RegistryService       registry.Service
+	registryService       registry.Service
 	EventsService         *events.Events
 	netController         libnetwork.NetworkController
 	volumes               *volumesservice.VolumesService
 	root                  string
-	seccompEnabled        bool
-	apparmorEnabled       bool
+	sysInfoOnce           sync.Once
+	sysInfo               *sysinfo.SysInfo
 	shutdown              bool
-	idMapping             *idtools.IdentityMapping
+	idMapping             idtools.IdentityMapping
 	graphDriver           string        // TODO: move graphDriver field to an InfoService
 	PluginStore           *plugin.Store // TODO: remove
 	pluginManager         *plugin.Manager
@@ -153,7 +151,7 @@ func (daemon *Daemon) RegistryHosts() docker.RegistryHosts {
 	var (
 		registryKey = "docker.io"
 		mirrors     = make([]string, len(daemon.configStore.Mirrors))
-		m           = map[string]resolver.RegistryConfig{}
+		m           = map[string]resolverconfig.RegistryConfig{}
 	)
 	// must trim "https://" or "http://" prefix
 	for i, v := range daemon.configStore.Mirrors {
@@ -163,11 +161,11 @@ func (daemon *Daemon) RegistryHosts() docker.RegistryHosts {
 		mirrors[i] = v
 	}
 	// set mirrors for default registry
-	m[registryKey] = resolver.RegistryConfig{Mirrors: mirrors}
+	m[registryKey] = resolverconfig.RegistryConfig{Mirrors: mirrors}
 
 	for _, v := range daemon.configStore.InsecureRegistries {
 		u, err := url.Parse(v)
-		c := resolver.RegistryConfig{}
+		c := resolverconfig.RegistryConfig{}
 		if err == nil {
 			v = u.Host
 			t := true
@@ -181,17 +179,15 @@ func (daemon *Daemon) RegistryHosts() docker.RegistryHosts {
 	}
 
 	for k, v := range m {
-		if d, err := registry.HostCertsDir(k); err == nil {
-			v.TLSConfigDir = []string{d}
-			m[k] = v
-		}
+		v.TLSConfigDir = []string{registry.HostCertsDir(k)}
+		m[k] = v
 	}
 
 	certsDir := registry.CertsDir()
 	if fis, err := os.ReadDir(certsDir); err == nil {
 		for _, fi := range fis {
 			if _, ok := m[fi.Name()]; !ok {
-				m[fi.Name()] = resolver.RegistryConfig{
+				m[fi.Name()] = resolverconfig.RegistryConfig{
 					TLSConfigDir: []string{filepath.Join(certsDir, fi.Name())},
 				}
 			}
@@ -475,8 +471,11 @@ func (daemon *Daemon) restore() error {
 	}
 	group.Wait()
 
-	daemon.netController, err = daemon.initNetworkController(daemon.configStore, activeSandboxes)
-	if err != nil {
+	// Initialize the network controller and configure network settings.
+	//
+	// Note that we cannot initialize the network controller earlier, as it
+	// needs to know if there's active sandboxes (running containers).
+	if err = daemon.initNetworkController(activeSandboxes); err != nil {
 		return fmt.Errorf("Error initializing network controller: %v", err)
 	}
 
@@ -851,7 +850,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		}
 	}
 
-	d.RegistryService = registryService
+	d.registryService = registryService
 	logger.RegisterPluginGetter(d.PluginStore)
 
 	metricsSockPath, err := d.listenMetricsSock()
@@ -884,7 +883,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		// It is not harm to add WithBlock for containerd connection.
 		grpc.WithBlock(),
 
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithConnectParams(connParams),
 		grpc.WithContextDialer(dialer.ContextDialer),
 
@@ -948,7 +947,6 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		IDMapping:                 idMapping,
 		PluginGetter:              d.PluginStore,
 		ExperimentalEnabled:       config.Experimental,
-		OS:                        runtime.GOOS,
 	})
 	if err != nil {
 		return nil, err
@@ -1021,7 +1019,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		return nil, errors.New("Devices cgroup isn't mounted")
 	}
 
-	d.ID = trustKey.PublicKey().KeyID()
+	d.id = trustKey.PublicKey().KeyID()
 	d.repository = daemonRepo
 	d.containers = container.NewMemoryStore()
 	if d.containersReplica, err = container.NewViewDB(); err != nil {
@@ -1034,8 +1032,6 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 	d.EventsService = events.New()
 	d.root = config.Root
 	d.idMapping = idMapping
-	d.seccompEnabled = sysInfo.Seccomp
-	d.apparmorEnabled = sysInfo.AppArmor
 
 	d.linkIndex = newLinkIndex()
 
@@ -1045,9 +1041,9 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		EventsService:             d.EventsService,
 		ImageStore:                imageStore,
 		LayerStore:                layerStore,
-		MaxConcurrentDownloads:    *config.MaxConcurrentDownloads,
-		MaxConcurrentUploads:      *config.MaxConcurrentUploads,
-		MaxDownloadAttempts:       *config.MaxDownloadAttempts,
+		MaxConcurrentDownloads:    config.MaxConcurrentDownloads,
+		MaxConcurrentUploads:      config.MaxConcurrentUploads,
+		MaxDownloadAttempts:       config.MaxDownloadAttempts,
 		ReferenceStore:            rs,
 		RegistryService:           registryService,
 		TrustKey:                  trustKey,
@@ -1123,10 +1119,8 @@ func (daemon *Daemon) waitForStartupDone() {
 }
 
 func (daemon *Daemon) shutdownContainer(c *container.Container) error {
-	stopTimeout := c.StopTimeout()
-
 	// If container failed to exit in stopTimeout seconds of SIGTERM, then using the force
-	if err := daemon.containerStop(c, stopTimeout); err != nil {
+	if err := daemon.containerStop(context.TODO(), c, containertypes.StopOptions{}); err != nil {
 		return fmt.Errorf("Failed to stop container %s with error: %v", c.ID, err)
 	}
 
@@ -1207,7 +1201,9 @@ func (daemon *Daemon) Shutdown() error {
 	}
 
 	if daemon.imageService != nil {
-		daemon.imageService.Cleanup()
+		if err := daemon.imageService.Cleanup(); err != nil {
+			logrus.Error(err)
+		}
 	}
 
 	// If we are part of a cluster, clean up cluster's stuff
@@ -1352,36 +1348,34 @@ func isBridgeNetworkDisabled(conf *config.Config) bool {
 	return conf.BridgeConfig.Iface == config.DisableNetworkBridge
 }
 
-func (daemon *Daemon) networkOptions(dconfig *config.Config, pg plugingetter.PluginGetter, activeSandboxes map[string]interface{}) ([]nwconfig.Option, error) {
+func (daemon *Daemon) networkOptions(pg plugingetter.PluginGetter, activeSandboxes map[string]interface{}) ([]nwconfig.Option, error) {
 	options := []nwconfig.Option{}
-	if dconfig == nil {
+	if daemon.configStore == nil {
 		return options, nil
 	}
-
-	options = append(options, nwconfig.OptionExperimental(dconfig.Experimental))
-	options = append(options, nwconfig.OptionDataDir(dconfig.Root))
-	options = append(options, nwconfig.OptionExecRoot(dconfig.GetExecRoot()))
-
+	conf := daemon.configStore
 	dd := runconfig.DefaultDaemonNetworkMode()
-	dn := runconfig.DefaultDaemonNetworkMode().NetworkName()
-	options = append(options, nwconfig.OptionDefaultDriver(string(dd)))
-	options = append(options, nwconfig.OptionDefaultNetwork(dn))
-	options = append(options, nwconfig.OptionLabels(dconfig.Labels))
-	options = append(options, driverOptions(dconfig))
 
-	if len(dconfig.NetworkConfig.DefaultAddressPools.Value()) > 0 {
-		options = append(options, nwconfig.OptionDefaultAddressPoolConfig(dconfig.NetworkConfig.DefaultAddressPools.Value()))
+	options = []nwconfig.Option{
+		nwconfig.OptionExperimental(conf.Experimental),
+		nwconfig.OptionDataDir(conf.Root),
+		nwconfig.OptionExecRoot(conf.GetExecRoot()),
+		nwconfig.OptionDefaultDriver(string(dd)),
+		nwconfig.OptionDefaultNetwork(dd.NetworkName()),
+		nwconfig.OptionLabels(conf.Labels),
+		nwconfig.OptionNetworkControlPlaneMTU(conf.NetworkControlPlaneMTU),
+		driverOptions(conf),
 	}
 
-	if daemon.configStore != nil && daemon.configStore.LiveRestoreEnabled && len(activeSandboxes) != 0 {
+	if len(conf.NetworkConfig.DefaultAddressPools.Value()) > 0 {
+		options = append(options, nwconfig.OptionDefaultAddressPoolConfig(conf.NetworkConfig.DefaultAddressPools.Value()))
+	}
+	if conf.LiveRestoreEnabled && len(activeSandboxes) != 0 {
 		options = append(options, nwconfig.OptionActiveSandboxes(activeSandboxes))
 	}
-
 	if pg != nil {
 		options = append(options, nwconfig.OptionPluginGetter(pg))
 	}
-
-	options = append(options, nwconfig.OptionNetworkControlPlaneMTU(dconfig.NetworkControlPlaneMTU))
 
 	return options, nil
 }
@@ -1459,7 +1453,7 @@ func (daemon *Daemon) GetAttachmentStore() *network.AttachmentStore {
 }
 
 // IdentityMapping returns uid/gid mapping or a SID (in the case of Windows) for the builder
-func (daemon *Daemon) IdentityMapping() *idtools.IdentityMapping {
+func (daemon *Daemon) IdentityMapping() idtools.IdentityMapping {
 	return daemon.idMapping
 }
 
@@ -1474,4 +1468,17 @@ func (daemon *Daemon) BuilderBackend() builder.Backend {
 		*Daemon
 		*images.ImageService
 	}{daemon, daemon.imageService}
+}
+
+// RawSysInfo returns *sysinfo.SysInfo .
+func (daemon *Daemon) RawSysInfo() *sysinfo.SysInfo {
+	daemon.sysInfoOnce.Do(func() {
+		// We check if sysInfo is not set here, to allow some test to
+		// override the actual sysInfo.
+		if daemon.sysInfo == nil {
+			daemon.loadSysInfo()
+		}
+	})
+
+	return daemon.sysInfo
 }

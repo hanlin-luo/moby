@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/docker/docker/pkg/homedir"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -131,13 +132,6 @@ func ParseTCPAddr(tryAddr string, defaultAddr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// url.Parse fails for trailing colon on IPv6 brackets on Go 1.5, but
-	// not 1.4. See https://github.com/golang/go/issues/12200 and
-	// https://github.com/golang/go/issues/6530.
-	if strings.HasSuffix(addr, "]:") {
-		addr += defaultPort
-	}
-
 	u, err := url.Parse("tcp://" + addr)
 	if err != nil {
 		return "", err
@@ -162,7 +156,11 @@ func ParseTCPAddr(tryAddr string, defaultAddr string) (string, error) {
 		return "", fmt.Errorf("Invalid bind address format: %s", tryAddr)
 	}
 
-	return fmt.Sprintf("tcp://%s%s", net.JoinHostPort(host, port), u.Path), nil
+	if u.Path != "" {
+		return "", errors.Errorf("invalid bind address (%s): should not contain a path element", tryAddr)
+	}
+
+	return "tcp://" + net.JoinHostPort(host, port), nil
 }
 
 // ValidateExtraHost validates that the specified string is a valid extrahost and returns it.
